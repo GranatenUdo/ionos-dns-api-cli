@@ -50,15 +50,20 @@ pub struct Client {
 
 impl Client {
     pub fn new(key: ApiKey) -> Result<Self> {
-        let config = ureq::Agent::config_builder()
+        let base = base_url()?;
+        let mut builder = ureq::Agent::config_builder()
             .max_redirects(0)
             .http_status_as_error(false)
             .timeout_global(Some(Duration::from_secs(30)))
-            .user_agent(concat!("ionos-dns-api-cli/", env!("CARGO_PKG_VERSION")))
-            .build();
+            .user_agent(concat!("ionos-dns-api-cli/", env!("CARGO_PKG_VERSION")));
+        if base != DEFAULT_BASE {
+            // The loopback override speaks plain HTTP: never route it (and the key) through a proxy from the
+            // environment.
+            builder = builder.proxy(None);
+        }
         Ok(Self {
-            agent: config.into(),
-            base: base_url()?,
+            agent: builder.build().into(),
+            base,
             key,
         })
     }

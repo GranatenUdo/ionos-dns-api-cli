@@ -1,11 +1,12 @@
 # ionos-dns-api-cli
 
-A small, read-only command-line tool for the [IONOS hosting DNS API](https://developer.hosting.ionos.de/docs/dns)
+A small command-line tool for the [IONOS hosting DNS API](https://developer.hosting.ionos.de/docs/dns)
 (the DNS of domains hosted at IONOS, `api.hosting.ionos.com`, not IONOS Cloud). It lists zones and records, exports a
 zone as a BIND zone file or as lossless JSON, and verifies that other nameservers answer the same records. That is
 what you need before you move a domain's DNS to another provider.
 
-The binary is called `ionos-dns`. Version 0.1 sends **GET requests only**; it cannot change your DNS.
+The binary is called `ionos-dns`. Version 0.1 sends **GET requests only** to the API; it cannot change your DNS.
+It runs on Linux and macOS.
 
 ## Install
 
@@ -19,25 +20,31 @@ cargo install --git https://github.com/GranatenUdo/ionos-dns-api-cli --tag v0.1.
 
 Create a key in the IONOS developer portal (<https://developer.hosting.ionos.de/docs/getstarted>). It has the form
 `<prefix>.<secret>` and can read and change the DNS of every domain in your IONOS account, so keep it private and
-delete it when you no longer need it.
+delete it in the portal when you no longer need it.
 
-`ionos-dns` reads the key **only from a file** that belongs to you and is not readable by group or others (mode
-0600). It never accepts the key as an argument or environment variable and never prints it. The file is looked up in
-this order: `--key-file PATH`, `$IONOS_API_KEY_FILE`, `$XDG_CONFIG_HOME/ionos-dns/api-key` (default
-`~/.config/ionos-dns/api-key`).
+```sh
+ionos-dns login      # hidden prompt; tests the key with one read-only call, then stores it
+ionos-dns status     # which file, its permissions, the key's public prefix, and whether the API accepts it
+ionos-dns logout     # removes the key file (the key stays valid until you delete it in the portal)
+```
 
-Store the key without echoing it or leaving it in your shell history:
+`login` reads the key at a hidden prompt (echo off; Ctrl-C and Ctrl-Z restore the terminal), checks its form, asks the
+API for the zone list with it, and only then stores it in a file of mode 0600 in a directory of mode 0700. It never
+replaces a stored key unless you pass `--force`, and it refuses a key given as a command-line argument, because
+arguments are visible to other processes and land in your shell history. For scripts, pipe the key in with
+`login --stdin` (refused when standard input is a terminal, which would show the key).
+
+At use time, every command reads the key **only from that file**: it must belong to you and must not be readable by
+group or others. The key is never accepted as an argument or environment variable and never printed. The file is
+looked up in this order: `--key-file PATH`, `$IONOS_API_KEY_FILE`, `$XDG_CONFIG_HOME/ionos-dns/api-key` (default
+`~/.config/ionos-dns/api-key`). `login`, `status` and `logout` use the same lookup.
+
+Without `login`, store the key by hand without echoing it:
 
 ```sh
 # bash or zsh
 mkdir -p -m 700 ~/.config/ionos-dns
 ( umask 077; read -rs K && printf %s "$K" > ~/.config/ionos-dns/api-key )
-```
-
-```fish
-# fish
-mkdir -p -m 700 ~/.config/ionos-dns
-umask 077; read -s -P 'IONOS key: ' K; and printf %s $K > ~/.config/ionos-dns/api-key; set -e K; umask 022
 ```
 
 ## Commands
@@ -95,8 +102,8 @@ ionos-dns verify example.com --ns ada.ns.cloudflare.com --skip _domainconnect:CN
 |---|---|
 | 0 | success; `verify`: every compared record set matches |
 | 1 | `verify`: at least one record set differs |
-| 2 | invalid arguments |
-| 3 | authentication, API, key-file or local I/O failure |
+| 2 | invalid arguments or input (for `login`: a malformed key, a key already stored without `--force`, no terminal without `--stdin`) |
+| 3 | authentication, API, key-file or local I/O failure (for `status`: anything not in order, including a network failure) |
 | 5 | `verify`: a nameserver did not answer usably (timeout, REFUSED, SERVFAIL, missing AA flag) |
 
 ## Security notes

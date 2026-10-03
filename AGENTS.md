@@ -36,14 +36,17 @@ Every assignment follows three ordered steps; do not skip or merge them.
 
 - Never commit API keys, real domain names, zone or record ids, zone exports or captured API responses. Tests, fixtures
   and docs use `example.com`, `example.net`, documentation addresses (192.0.2.0/24, 2001:db8::/32) and made-up ids.
-- The key is read only from a private file (owner-only, mode 0600). Never add a `--key` argument, a key environment
-  variable, a verbose mode that prints headers, or logging of request headers.
+- At use time the key is read only from a private file (owner-only, mode 0600). `login` is the only command that takes
+  a key from elsewhere: from a hidden terminal prompt or from a piped standard input, and it stores the key through a
+  private temporary file before the first API call. Never add a `--key` argument, a key environment variable, a verbose
+  mode that prints headers, or logging of request headers; keep the hidden prompt's signal handling and terminal
+  restore (see `src/prompt.rs`) and their pty tests.
 - HTTP never follows redirects (a redirect would carry `X-API-Key` elsewhere) and the base-URL override accepts
   loopback addresses only. Keep both, with their tests.
 
 ## Tool safety
 
-- v0.1 is read-only: GET requests only. Never use `PUT /v1/zones/{id}`: it replaces every record of the zone.
+- v0.1 changes no DNS: GET requests to the API only. Never use `PUT /v1/zones/{id}`: it replaces every record of the zone.
 - Write commands (planned for v0.2) must be dry-run by default with `--yes` to apply, refuse NS and SOA, protect mail
   records behind an explicit flag, use a deny-by-default zone allowlist, send whole record sets via PATCH, read the zone
   back afterwards, and be verified live on a scratch record before release.

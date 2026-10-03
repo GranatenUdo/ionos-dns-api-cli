@@ -1,10 +1,14 @@
-//! `ionos-dns`: a small read-only CLI for the IONOS hosting DNS API. See README.md.
+//! `ionos-dns`: a small CLI for the IONOS hosting DNS API that reads DNS only. See README.md.
+#[cfg(not(unix))]
+compile_error!("ionos-dns supports Unix-like systems (Linux, macOS) only");
+
 mod bind;
 mod client;
 mod error;
 mod key;
 mod model;
 mod output;
+mod prompt;
 mod txt;
 mod verify;
 
@@ -19,7 +23,7 @@ use std::process::ExitCode;
 #[command(
     name = "ionos-dns",
     version,
-    about = "Read-only CLI for the IONOS hosting DNS API: list, export, verify"
+    about = "CLI for the IONOS hosting DNS API: store a key, list, export, verify (reads DNS only)"
 )]
 struct Cli {
     /// File holding the API key <prefix>.<secret> (default: $IONOS_API_KEY_FILE, else $XDG_CONFIG_HOME/ionos-dns/api-key)
@@ -31,6 +35,26 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Store an API key: hidden entry, format check, a read-only test call, then a private 0600 file
+    Login {
+        /// Read the key from standard input (for scripts; not on a terminal, where entry is hidden instead)
+        #[arg(long)]
+        stdin: bool,
+        /// Replace a key that is already stored
+        #[arg(long)]
+        force: bool,
+        /// Catches a key typed as an argument, which is rejected without repeating it.
+        #[arg(hide = true, num_args = 0.., allow_hyphen_values = true)]
+        stray: Vec<String>,
+    },
+    /// Remove the stored key file (the key stays valid until you delete it in the IONOS developer portal)
+    Logout,
+    /// Check the stored key: file, permissions, format and whether the API accepts it
+    Status {
+        /// Print the report as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// List the zones of the account
     Zones {
         /// Print the API's JSON instead of a table
@@ -95,7 +119,17 @@ enum Format {
     Json,
 }
 
+/// Where API keys are created.
+const PORTAL_URL: &str = "https://developer.hosting.ionos.de/docs/getstarted";
+
 fn main() -> ExitCode {
+    // No core dumps: a dump during a request would contain the key.
+    let none = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: a valid rlimit struct; lowering a limit cannot fail in a way that matters here.
+    unsafe { libc::setrlimit(libc::RLIMIT_CORE, &none) };
     let cli = Cli::parse();
     match run(cli) {
         Ok(code) => ExitCode::from(code),
@@ -109,6 +143,24 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<u8> {
     let key_file = cli.key_file.as_deref();
     match cli.command {
+        Command::Login {
+            stdin,
+            force,
+            stray,
+        } => login(key_file, stdin, force, &stray),
+        Command::Logout => {
+            let path = key::key_path(key_file)?;
+            if key::remove(&path)? {
+                println!(
+                    "Removed the key file {}. The key itself stays valid until you delete it in the IONOS developer portal: {PORTAL_URL}",
+                    path.display()
+                );
+            } else {
+                println!("No key stored at {}.", path.display());
+            }
+            Ok(0)
+        }
+        Command::Status { json } => status(key_file, json),
         Command::Zones { json } => {
             let value = connect(key_file)?.zones()?;
             if json {
@@ -267,6 +319,119 @@ fn run(cli: Cli) -> Result<u8> {
             })
         }
     }
+}
+
+fn login(key_file: Option<&Path>, from_stdin: bool, force: bool, stray: &[String]) -> Result<u8> {
+    if !stray.is_empty() {
+        return Err(Exit::usage(
+            "login takes no key as an argument: an argument is visible to other processes and stays in your shell \
+             history. If you typed a key, delete it in the IONOS developer portal and create a new one, then run \
+             `ionos-dns login` and enter it at the hidden prompt.",
+        ));
+    }
+    let path = key::key_path(key_file)?;
+    key::check_target(&path, force)?;
+    let mut raw = if from_stdin {
+        if prompt::stdin_is_terminal() {
+            return Err(Exit::usage(
+                "standard input is a terminal, where --stdin would show the key: omit --stdin for hidden entry",
+            ));
+        }
+        prompt::read_stdin()?
+    } else {
+        eprintln!(
+            "Create an API key in the IONOS developer portal: {PORTAL_URL}\nIt will be stored in {}.",
+            path.display()
+        );
+        prompt::read_hidden("IONOS API key (input hidden): ")?
+    };
+    let parsed = std::str::from_utf8(&raw).ok().and_then(key::ApiKey::parse);
+    key::wipe(&mut raw);
+    let entered = parsed
+        .ok_or_else(|| Exit::usage("that is not an IONOS API key of the form <prefix>.<secret>"))?;
+    let dir = key::prepare_dir(&path)?;
+    let temp = key::TempKey::write(&dir, &entered)?;
+    drop(entered);
+    // The test call uses the key as every other command does: loaded from a private file.
+    let stored = key::load(temp.path())?;
+    let prefix = stored.prefix().to_owned();
+    let zones = model::zones_from(&client::Client::new(stored)?.zones()?)?;
+    temp.commit(&path, force)?;
+    println!(
+        "Stored the key {prefix}.… in {}. The API accepted it and lists {} zone{}.",
+        path.display(),
+        zones.len(),
+        if zones.len() == 1 { "" } else { "s" }
+    );
+    Ok(0)
+}
+
+fn status(key_file: Option<&Path>, json: bool) -> Result<u8> {
+    let path = key::key_path(key_file)?;
+    let state = key::inspect(&path);
+    // The API is asked only with a key that passes the same checks as every other command.
+    let api = match key::load(&path) {
+        Err(e) => {
+            serde_json::json!({ "checked": false, "ok": false, "zones": null, "error": e.message })
+        }
+        Ok(loaded) => match client::Client::new(loaded)
+            .and_then(|c| c.zones())
+            .and_then(|v| model::zones_from(&v))
+        {
+            Ok(zones) => {
+                serde_json::json!({ "checked": true, "ok": true, "zones": zones.len(), "error": null })
+            }
+            Err(e) => {
+                serde_json::json!({ "checked": true, "ok": false, "zones": null, "error": e.message })
+            }
+        },
+    };
+    let ok = api["ok"].as_bool().unwrap_or(false);
+    if json {
+        let mut doc = serde_json::to_value(&state).map_err(|e| Exit::api(e.to_string()))?;
+        doc["api"] = api;
+        emit(None, &output::json(&doc)?)?;
+    } else {
+        let yes = |b: bool| if b { "yes" } else { "no" };
+        let mut text = format!("key file:   {}\n", state.path);
+        if !state.exists {
+            text.push_str("exists:     no (store a key with `ionos-dns login`)\n");
+        } else {
+            text.push_str(&format!(
+                "file:       regular {}, symlink {}, owned by you {}, mode {}\n",
+                yes(state.regular),
+                yes(state.symlink),
+                yes(state.owner_ok),
+                state.mode.as_deref().unwrap_or("?")
+            ));
+            text.push_str(&format!(
+                "key:        {}\n",
+                match &state.prefix {
+                    Some(prefix) => format!("{prefix}.… (format ok)"),
+                    None => "not of the form <prefix>.<secret>".to_owned(),
+                }
+            ));
+        }
+        if let Some(mode) = &state.dir_mode {
+            text.push_str(&format!(
+                "directory:  mode {mode}, owned by you or root {}\n",
+                yes(state.dir_owner_ok.unwrap_or(false))
+            ));
+        }
+        text.push_str(&match (api["checked"].as_bool(), ok) {
+            (Some(true), true) => format!("api:        key accepted, {} zones\n", api["zones"]),
+            (Some(true), false) => format!(
+                "api:        failed: {}\n",
+                api["error"].as_str().unwrap_or("?")
+            ),
+            _ => format!(
+                "api:        not checked: {}\n",
+                api["error"].as_str().unwrap_or("?")
+            ),
+        });
+        emit(None, &text)?;
+    }
+    Ok(if ok { 0 } else { error::API })
 }
 
 fn connect(key_file: Option<&Path>) -> Result<client::Client> {

@@ -42,7 +42,8 @@ pub const KEY: &str = "testprefix.TopSecretValue123";
 
 // ---------- running the binary ----------
 
-pub fn run(args: &[&str], base: Option<&str>, home: &Path) -> Output {
+/// The binary with a clean environment: only HOME (and the optional API base) set from the test.
+pub fn command(args: &[&str], base: Option<&str>, home: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ionos-dns"));
     command
         .args(args)
@@ -53,13 +54,38 @@ pub fn run(args: &[&str], base: Option<&str>, home: &Path) -> Output {
     if let Some(base) = base {
         command.env("IONOS_DNS_API_BASE", base);
     }
-    let output = command.output().unwrap();
-    let all = format!("{}{}", stdout(&output), stderr(&output));
+    command
+}
+
+pub fn run(args: &[&str], base: Option<&str>, home: &Path) -> Output {
+    let output = command(args, base, home).output().unwrap();
+    assert_no_leak(&output);
+    output
+}
+
+/// Runs with `input` on standard input (a pipe, not a terminal).
+pub fn run_input(command: &mut Command, input: &[u8]) -> Output {
+    use std::process::Stdio;
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let _ = stdin.write_all(input);
+    drop(stdin);
+    let output = child.wait_with_output().unwrap();
+    assert_no_leak(&output);
+    output
+}
+
+pub fn assert_no_leak(output: &Output) {
+    let all = format!("{}{}", stdout(output), stderr(output));
     assert!(
         !all.contains("TopSecretValue123"),
         "the key leaked into the output:\n{all}"
     );
-    output
 }
 
 pub fn stdout(output: &Output) -> String {
