@@ -52,15 +52,19 @@ enum Action<'a> {
 
 struct Session {
     status: ExitStatus,
+    prompts: usize,
     stderr: String,
     stdout: String,
     terminal_output: Vec<u8>,
     echo_restored: bool,
 }
 
-/// Runs `login` with the pty as its controlling terminal, waits for the prompt, then types or interrupts.
-fn session(home: &std::path::Path, base: &str, action: Action) -> Session {
-    session_with(home, base, &[], &[], action)
+const PROMPT: &str = "(input hidden): ";
+
+/// Runs `login` with the pty as its controlling terminal; step n waits for the n-th hidden prompt, then types or
+/// interrupts.
+fn session(home: &std::path::Path, base: &str, steps: &[Action]) -> Session {
+    session_with(home, base, &[], &[], steps)
 }
 
 fn session_with(
@@ -68,7 +72,7 @@ fn session_with(
     base: &str,
     extra_args: &[&str],
     envs: &[(&str, &str)],
-    action: Action,
+    steps: &[Action],
 ) -> Session {
     let pty = open_pty();
     assert!(echo_on(&pty.slave), "a new pty starts with echo on");
@@ -107,21 +111,33 @@ fn session_with(
         all
     });
     let mut seen = Vec::new();
-    while !String::from_utf8_lossy(&seen).contains("(input hidden): ") {
-        let chunk = rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("the prompt did not appear");
-        seen.extend_from_slice(&chunk);
-    }
     let mut master = pty.master;
-    match action {
-        Action::Type(text) => master.write_all(text).unwrap(),
-        // SAFETY: signals the child process we spawned.
-        Action::Interrupt => unsafe {
-            libc::kill(child.id() as libc::pid_t, libc::SIGINT);
-        },
+    for (index, step) in steps.iter().enumerate() {
+        while String::from_utf8_lossy(&seen).matches(PROMPT).count() <= index {
+            let chunk = rx
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap_or_else(|_| panic!("prompt {} did not appear", index + 1));
+            seen.extend_from_slice(&chunk);
+        }
+        match step {
+            Action::Type(text) => master.write_all(text).unwrap(),
+            // SAFETY: signals the child process we spawned.
+            Action::Interrupt => unsafe {
+                libc::kill(child.id() as libc::pid_t, libc::SIGINT);
+            },
+        }
     }
-    let status = child.wait().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("login did not finish");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
     let mut stdout = String::new();
     child
         .stdout
@@ -147,6 +163,7 @@ fn session_with(
     }
     Session {
         status,
+        prompts: stderr.matches(PROMPT).count(),
         stderr,
         stdout,
         terminal_output,
@@ -161,7 +178,7 @@ fn the_key_is_entered_hidden_and_echo_comes_back() {
     let s = session(
         &home,
         &stub.base,
-        Action::Type(format!("{KEY}\n").as_bytes()),
+        &[Action::Type(format!("{KEY}\n").as_bytes())],
     );
     assert_eq!(s.status.code(), Some(0), "{}{}", s.stdout, s.stderr);
     assert!(
@@ -185,10 +202,16 @@ fn the_key_is_entered_hidden_and_echo_comes_back() {
 fn malformed_input_restores_echo() {
     let stub = api_stub();
     let home = temp_dir();
-    let s = session(&home, &stub.base, Action::Type(b"not-a-key\n"));
+    let s = session(&home, &stub.base, &[Action::Type(b"not a key\n")]);
     assert_eq!(s.status.code(), Some(2), "{}", s.stderr);
     assert!(s.echo_restored);
-    assert!(!String::from_utf8_lossy(&s.terminal_output).contains("not-a-key"));
+    assert!(!String::from_utf8_lossy(&s.terminal_output).contains("not a key"));
+    assert!(s.stderr.contains("contains a space"), "{}", s.stderr);
+    assert!(!s.stderr.contains("not a key"), "the input is never shown");
+    assert_eq!(
+        s.prompts, 1,
+        "a bad first part is refused before the second prompt"
+    );
     assert!(stub.requests.lock().unwrap().is_empty());
 }
 
@@ -196,7 +219,7 @@ fn malformed_input_restores_echo() {
 fn an_interrupt_restores_echo_and_stores_nothing() {
     let stub = api_stub();
     let home = temp_dir();
-    let s = session(&home, &stub.base, Action::Interrupt);
+    let s = session(&home, &stub.base, &[Action::Interrupt]);
     assert_eq!(
         s.status.signal(),
         Some(libc::SIGINT),
@@ -221,7 +244,7 @@ fn login_opens_the_key_page_in_a_session_of_its_own() {
         &stub.base,
         &[],
         &[("DISPLAY", ":99")],
-        Action::Type(format!("{KEY}\n").as_bytes()),
+        &[Action::Type(format!("{KEY}\n").as_bytes())],
     );
     assert_eq!(s.status.code(), Some(0), "{}{}", s.stdout, s.stderr);
     let record = wait_for_record(&home, 10).expect("the opener was not called");
@@ -267,7 +290,7 @@ fn no_browser_over_ssh_without_display_or_when_asked() {
             &stub.base,
             args,
             envs,
-            Action::Type(format!("{KEY}\n").as_bytes()),
+            &[Action::Type(format!("{KEY}\n").as_bytes())],
         );
         assert_eq!(s.status.code(), Some(0), "{}{}", s.stdout, s.stderr);
         assert!(
@@ -294,7 +317,7 @@ fn a_missing_opener_does_not_stop_login() {
         &stub.base,
         &[],
         &[("DISPLAY", ":99"), ("PATH", empty.to_str().unwrap())],
-        Action::Type(format!("{KEY}\n").as_bytes()),
+        &[Action::Type(format!("{KEY}\n").as_bytes())],
     );
     assert_eq!(s.status.code(), Some(0), "{}{}", s.stdout, s.stderr);
     assert!(
@@ -303,4 +326,107 @@ fn a_missing_opener_does_not_stop_login() {
         s.stderr
     );
     assert!(home.join(".config/ionos-dns/api-key").is_file());
+}
+
+fn stored_key(home: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(home.join(".config/ionos-dns/api-key")).ok()
+}
+
+#[test]
+fn the_whole_key_takes_one_prompt() {
+    let stub = api_stub();
+    let home = temp_dir();
+    let s = session(
+        &home,
+        &stub.base,
+        &[Action::Type(format!("{KEY}\n").as_bytes())],
+    );
+    assert_eq!(s.status.code(), Some(0), "{}", s.stderr);
+    assert_eq!(s.prompts, 1, "{}", s.stderr);
+}
+
+#[test]
+fn prefix_and_encrypted_part_in_two_prompts() {
+    let stub = api_stub();
+    let home = temp_dir();
+    let s = session(
+        &home,
+        &stub.base,
+        &[
+            Action::Type(b"testprefix\n"),
+            Action::Type(b"TopSecretValue123\n"),
+        ],
+    );
+    assert_eq!(s.status.code(), Some(0), "{}{}", s.stdout, s.stderr);
+    assert_eq!(s.prompts, 2);
+    assert!(
+        s.stderr.contains("Encrypted part of the key"),
+        "{}",
+        s.stderr
+    );
+    assert_eq!(
+        stored_key(&home).as_deref(),
+        Some(format!("{KEY}\n").as_str())
+    );
+    assert_eq!(
+        stub.requests.lock().unwrap()[0].header("X-API-Key"),
+        Some(KEY)
+    );
+    let echoed = String::from_utf8_lossy(&s.terminal_output).into_owned();
+    assert!(
+        !echoed.contains("testprefix") && !echoed.contains("TopSecretValue123"),
+        "echoed: {echoed}"
+    );
+    assert!(s.echo_restored);
+}
+
+#[test]
+fn both_parts_typed_ahead_are_kept() {
+    let stub = api_stub();
+    let home = temp_dir();
+    let s = session(
+        &home,
+        &stub.base,
+        &[Action::Type(b"testprefix\nTopSecretValue123\n")],
+    );
+    assert_eq!(s.status.code(), Some(0), "{}{}", s.stdout, s.stderr);
+    assert_eq!(s.prompts, 2);
+    assert_eq!(
+        stored_key(&home).as_deref(),
+        Some(format!("{KEY}\n").as_str())
+    );
+}
+
+#[test]
+fn an_interrupt_at_the_second_prompt_stores_nothing() {
+    let stub = api_stub();
+    let home = temp_dir();
+    let s = session(
+        &home,
+        &stub.base,
+        &[Action::Type(b"testprefix\n"), Action::Interrupt],
+    );
+    assert_eq!(s.status.signal(), Some(libc::SIGINT));
+    assert!(s.echo_restored);
+    assert!(stored_key(&home).is_none());
+    assert!(stub.requests.lock().unwrap().is_empty());
+}
+
+#[test]
+fn bracketed_paste_markers_are_removed() {
+    let stub = api_stub();
+    let home = temp_dir();
+    let s = session(
+        &home,
+        &stub.base,
+        &[Action::Type(
+            format!("\x1b[200~{KEY}\x1b[201~\n").as_bytes(),
+        )],
+    );
+    assert_eq!(s.status.code(), Some(0), "{}{}", s.stdout, s.stderr);
+    assert_eq!(s.prompts, 1);
+    assert_eq!(
+        stored_key(&home).as_deref(),
+        Some(format!("{KEY}\n").as_str())
+    );
 }

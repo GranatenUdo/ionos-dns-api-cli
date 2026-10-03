@@ -361,3 +361,77 @@ fn stdin_login_and_login_without_a_terminal_never_open_a_browser() {
     assert_eq!(code(&out), 2, "{}", stderr(&out));
     assert!(wait_for_record(&home, 1).is_none(), "a browser was opened");
 }
+
+#[test]
+fn stdin_takes_the_key_in_two_lines_and_tolerates_copy_noise() {
+    let stub = api_stub();
+    let home = temp_dir();
+    let out = run_input(
+        &mut command(&["login", "--stdin"], Some(&stub.base), &home),
+        b"\r\n  testprefix \r\n\n\tTopSecretValue123\r\n\n",
+    );
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert_eq!(
+        std::fs::read_to_string(default_key(&home)).unwrap(),
+        format!("{KEY}\n")
+    );
+    assert_eq!(
+        stub.requests.lock().unwrap()[0].header("X-API-Key"),
+        Some(KEY)
+    );
+}
+
+#[test]
+fn stdin_refuses_wrong_shapes_without_an_api_call() {
+    let stub = api_stub();
+    let home = temp_dir();
+    for input in [
+        &b"a\nb\nc\n"[..],
+        b"a.b\nc\n",
+        b"a\nc.d\n",
+        b"nodotatall\n",
+        "pre\u{a0}fix.TopSecretValue123\n".as_bytes(),
+        b"\n\n",
+    ] {
+        let out = run_input(
+            &mut command(&["login", "--stdin"], Some(&stub.base), &home),
+            input,
+        );
+        assert_eq!(
+            code(&out),
+            2,
+            "{:?}: {}",
+            String::from_utf8_lossy(input),
+            stderr(&out)
+        );
+    }
+    assert!(stub.requests.lock().unwrap().is_empty());
+    assert!(!default_key(&home).exists());
+}
+
+#[test]
+fn swapped_parts_get_a_hint_that_never_shows_them() {
+    let stub = http_stub(|req| {
+        if req.header("X-API-Key") == Some(KEY) {
+            json(200, &zones_body())
+        } else {
+            json(
+                401,
+                r#"[{"code":"UNAUTHORIZED","message":"The customer is not authorized to do this operation."}]"#,
+            )
+        }
+    });
+    let home = temp_dir();
+    let out = run_input(
+        &mut command(&["login", "--stdin"], Some(&stub.base), &home),
+        b"TopSecretValue123\ntestprefix\n",
+    );
+    assert_eq!(code(&out), 3, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("check that the key prefix came first"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!stderr(&out).contains("testprefix"), "{}", stderr(&out));
+    assert!(!default_key(&home).exists());
+}

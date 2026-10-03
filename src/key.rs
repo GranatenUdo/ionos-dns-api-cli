@@ -54,6 +54,146 @@ impl fmt::Display for ApiKey {
     }
 }
 
+/// Key material: a buffer reserved at `MAX_KEY_BYTES` (so it never reallocates and leaves copies) that is wiped on
+/// drop.
+pub struct Secret(Vec<u8>);
+
+impl Secret {
+    pub fn new() -> Self {
+        Self(Vec::with_capacity(MAX_KEY_BYTES))
+    }
+
+    /// Appends within the reserved capacity; false (and nothing appended) when it would exceed `MAX_KEY_BYTES`.
+    pub fn extend(&mut self, bytes: &[u8]) -> bool {
+        if self.0.len() + bytes.len() > MAX_KEY_BYTES {
+            return false;
+        }
+        self.0.extend_from_slice(bytes);
+        true
+    }
+
+    pub fn resize_zeroed(&mut self, len: usize) {
+        self.0.resize(len.min(MAX_KEY_BYTES), 0);
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.0
+    }
+}
+
+impl Default for Secret {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        wipe(&mut self.0);
+    }
+}
+
+const PASTE_MARKERS: [&[u8]; 2] = [b"\x1b[200~", b"\x1b[201~"];
+
+/// One entered part, cleaned: bracketed-paste markers removed, surrounding ASCII whitespace (CR included) trimmed.
+/// Whitespace inside, control bytes and non-ASCII characters are refused; the message names `part` but never shows
+/// the input.
+pub fn clean_part(raw: &[u8], part: &str) -> Result<Secret> {
+    let mut stripped = Secret::new();
+    let mut i = 0;
+    while i < raw.len() {
+        if let Some(marker) = PASTE_MARKERS.iter().find(|m| raw[i..].starts_with(m)) {
+            i += marker.len();
+            continue;
+        }
+        stripped.extend(&raw[i..=i]);
+        i += 1;
+    }
+    let bytes = stripped.as_slice();
+    let start = bytes
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map_or(start, |p| p + 1);
+    let mut cleaned = Secret::new();
+    for &b in &bytes[start..end] {
+        let problem = if b >= 0x80 {
+            Some("a non-ASCII character")
+        } else if b.is_ascii_whitespace() {
+            Some("a space")
+        } else if b.is_ascii_control() {
+            Some("a control character")
+        } else {
+            None
+        };
+        if let Some(problem) = problem {
+            return Err(Exit::usage(format!(
+                "the {part} contains {problem}; copy it again from the IONOS developer portal"
+            )));
+        }
+        cleaned.extend(&[b]);
+    }
+    Ok(cleaned)
+}
+
+/// The key from one part (`<prefix>.<encrypted part>`) or from two parts (prefix, then encrypted part, joined with a
+/// dot). One part must contain a dot; in the two-part form neither part may.
+pub fn assemble(first: &Secret, second: Option<&Secret>) -> Result<ApiKey> {
+    let has_dot = |s: &Secret| s.as_slice().contains(&b'.');
+    let joined = match second {
+        None => {
+            if first.as_slice().is_empty() {
+                return Err(Exit::usage("nothing was entered"));
+            }
+            if !has_dot(first) {
+                return Err(Exit::usage(
+                    "the whole key has the form <prefix>.<encrypted part>; enter the prefix alone to be asked for \
+                     the encrypted part separately",
+                ));
+            }
+            let mut whole = Secret::new();
+            whole.extend(first.as_slice());
+            whole
+        }
+        Some(secret) => {
+            if first.as_slice().is_empty() || secret.as_slice().is_empty() {
+                return Err(Exit::usage(
+                    "the key prefix and the encrypted part must both be entered",
+                ));
+            }
+            if has_dot(first) || has_dot(secret) {
+                return Err(Exit::usage(
+                    "in two parts, neither the key prefix nor the encrypted part contains a dot; enter the whole key \
+                     <prefix>.<encrypted part> as one line instead",
+                ));
+            }
+            let mut whole = Secret::new();
+            if !(whole.extend(first.as_slice())
+                && whole.extend(b".")
+                && whole.extend(secret.as_slice()))
+            {
+                return Err(Exit::usage(format!(
+                    "the key is longer than {MAX_KEY_BYTES} bytes; that is not an IONOS API key"
+                )));
+            }
+            whole
+        }
+    };
+    std::str::from_utf8(joined.as_slice())
+        .ok()
+        .and_then(ApiKey::parse)
+        .ok_or_else(|| {
+            Exit::usage("that is not an IONOS API key of the form <prefix>.<encrypted part>")
+        })
+}
+
 /// Overwrites a buffer that held key material.
 pub fn wipe(bytes: &mut [u8]) {
     for byte in bytes.iter_mut() {
@@ -403,6 +543,45 @@ mod tests {
     fn never_prints_the_key() {
         let key = ApiKey::parse("abc123.topsecret").expect("valid");
         assert!(!format!("{key:?} {key}").contains("topsecret"));
+    }
+
+    fn secret(bytes: &[u8]) -> Secret {
+        let mut s = Secret::new();
+        assert!(s.extend(bytes));
+        s
+    }
+
+    #[test]
+    fn parts_are_cleaned_and_refused_without_echoing_them() {
+        let cleaned = clean_part(b"\x1b[200~  abc123\t\r\n\x1b[201~", "key prefix").unwrap();
+        assert_eq!(cleaned.as_slice(), b"abc123");
+        for (raw, kind) in [
+            (&b"ab c"[..], "a space"),
+            ("ab\u{a0}c".as_bytes(), "a non-ASCII character"),
+            (&b"ab\x07c"[..], "a control character"),
+        ] {
+            let err = clean_part(raw, "encrypted part").err().unwrap();
+            assert!(err.message.contains(kind), "{}", err.message);
+            assert!(err.message.contains("encrypted part"));
+            assert!(!err.message.contains("ab"), "the input is never shown");
+        }
+    }
+
+    #[test]
+    fn assembles_one_or_two_parts_with_the_dot_rule() {
+        let whole = assemble(&secret(b"abc.def"), None).unwrap();
+        assert_eq!(whole.expose(), "abc.def");
+        let joined = assemble(&secret(b"abc"), Some(&secret(b"def"))).unwrap();
+        assert_eq!(joined.expose(), "abc.def");
+        assert!(
+            assemble(&secret(b"abc"), None).is_err(),
+            "one part needs a dot"
+        );
+        assert!(assemble(&secret(b"a.b"), Some(&secret(b"c"))).is_err());
+        assert!(assemble(&secret(b"a"), Some(&secret(b"c.d"))).is_err());
+        assert!(assemble(&secret(b""), Some(&secret(b"c"))).is_err());
+        let long = vec![b'x'; MAX_KEY_BYTES];
+        assert!(assemble(&secret(b"a"), Some(&secret(&long))).is_err());
     }
 
     #[test]

@@ -1,11 +1,13 @@
 //! Reading a key for `login`: hidden entry on the terminal, or standard input for scripts. Both read with
-//! `libc::read` into bounded buffers that are zeroed afterwards (std's buffered stdin would keep a copy).
+//! `libc::read` into bounded `Secret` buffers that wipe themselves (std's buffered stdin would keep a copy).
 //!
-//! The terminal path follows readpassphrase(3): echo is switched off (and checked) before the prompt appears, the
-//! interrupt, quit, hang-up, terminate and job-control signals are caught without `SA_RESTART`, the terminal is
-//! restored before the signal is re-raised, and after a stop (Ctrl-Z) the prompt starts again with echo off.
+//! The terminal path follows readpassphrase(3): echo is switched off (and checked) before the first prompt appears,
+//! the interrupt, quit, hang-up, terminate and job-control signals are caught without `SA_RESTART`, the terminal is
+//! restored before the signal is re-raised, and after a stop (Ctrl-Z) only the part still missing is asked again.
+//! Both parts of a two-part key are read in one echo-off session, so pasted or typed-ahead input is never discarded
+//! and echo never comes back between the prompts.
 use crate::error::{Exit, Result};
-use crate::key::{MAX_KEY_BYTES, wipe};
+use crate::key::{MAX_KEY_BYTES, Secret, wipe};
 use libc::c_int;
 use std::sync::atomic::{AtomicI32, Ordering};
 
@@ -40,41 +42,37 @@ fn write_stderr(text: &str) {
     let _ = unsafe { libc::write(2, bytes.as_ptr().cast(), bytes.len()) };
 }
 
+fn too_long() -> Exit {
+    Exit::usage(format!(
+        "the input is longer than {MAX_KEY_BYTES} bytes; that is not an IONOS API key"
+    ))
+}
+
 /// Standard input up to `MAX_KEY_BYTES`; longer input is an error, not truncated.
-pub fn read_stdin() -> Result<Vec<u8>> {
-    let mut buffer = Vec::with_capacity(MAX_KEY_BYTES);
-    let mut chunk = [0u8; 512];
-    let result = loop {
-        // SAFETY: reads into a stack buffer of the given length.
-        let n = unsafe { libc::read(0, chunk.as_mut_ptr().cast(), chunk.len()) };
+pub fn read_stdin() -> Result<Secret> {
+    let mut buffer = Secret::new();
+    let mut chunk = Secret::new();
+    chunk.resize_zeroed(512);
+    loop {
+        let slice = chunk.as_mut_slice();
+        // SAFETY: reads into a buffer of the given length.
+        let n = unsafe { libc::read(0, slice.as_mut_ptr().cast(), slice.len()) };
         if n < 0 {
             if errno() == libc::EINTR {
                 continue;
             }
-            break Err(Exit::api("cannot read standard input"));
+            return Err(Exit::api("cannot read standard input"));
         }
         let n = n as usize;
         if n == 0 {
-            break Ok(());
+            return Ok(buffer);
         }
-        if buffer.len() + n > MAX_KEY_BYTES {
-            break Err(Exit::usage(format!(
-                "the input is longer than {MAX_KEY_BYTES} bytes; that is not an IONOS API key"
-            )));
-        }
-        buffer.extend_from_slice(&chunk[..n]);
-    };
-    wipe(&mut chunk);
-    match result {
-        Ok(()) => Ok(buffer),
-        Err(e) => {
-            wipe(&mut buffer);
-            Err(e)
+        if !buffer.extend(&chunk.as_slice()[..n]) {
+            return Err(too_long());
         }
     }
 }
 
-/// One line from the terminal with echo off.
 /// Standard input is this process's controlling terminal and we are in its foreground process group: the only
 /// situation in which the hidden prompt can work. `login` checks this before it opens a browser.
 pub fn check_terminal() -> Result<()> {
@@ -94,26 +92,30 @@ pub fn check_terminal() -> Result<()> {
     Ok(())
 }
 
-pub fn read_hidden(prompt: &str) -> Result<Vec<u8>> {
+/// Reads one or two hidden lines in a single echo-off session. After the first line, `wants_second` decides (and may
+/// refuse the first part early) whether the second prompt follows. Returns the raw lines.
+pub fn read_hidden_parts(
+    first_prompt: &str,
+    second_prompt: &str,
+    wants_second: &dyn Fn(&Secret) -> Result<bool>,
+) -> Result<Vec<Secret>> {
+    let mut parts: Vec<Secret> = Vec::new();
     loop {
         check_terminal()?;
         CAUGHT.store(0, Ordering::SeqCst);
         let saved = install_handlers();
-        let outcome = hidden_line(prompt);
+        let outcome = session(&mut parts, first_prompt, second_prompt, wants_second);
         restore_handlers(&saved);
         let signal = CAUGHT.swap(0, Ordering::SeqCst);
         if signal != 0 {
-            if let Ok(mut line) = outcome {
-                wipe(&mut line);
-            }
             // SAFETY: re-raises the caught signal with the original disposition back in place.
             unsafe { libc::raise(signal) };
             if matches!(signal, libc::SIGTSTP | libc::SIGTTIN | libc::SIGTTOU) {
-                continue;
+                continue; // resumed: ask again for the part still missing
             }
             return Err(Exit::usage("interrupted"));
         }
-        return outcome;
+        return outcome.map(|()| parts);
     }
 }
 
@@ -152,7 +154,13 @@ impl Drop for Restore {
     }
 }
 
-fn hidden_line(prompt: &str) -> Result<Vec<u8>> {
+/// One echo-off session: asks for the parts still missing in `parts`.
+fn session(
+    parts: &mut Vec<Secret>,
+    first_prompt: &str,
+    second_prompt: &str,
+    wants_second: &dyn Fn(&Secret) -> Result<bool>,
+) -> Result<()> {
     // SAFETY: termios is plain data filled by tcgetattr.
     let mut original: libc::termios = unsafe { std::mem::zeroed() };
     if unsafe { libc::tcgetattr(0, &mut original) } != 0 {
@@ -174,39 +182,49 @@ fn hidden_line(prompt: &str) -> Result<Vec<u8>> {
             "could not switch off the terminal echo; not reading the key",
         ));
     }
-    write_stderr(prompt);
-    let mut line = Vec::with_capacity(MAX_KEY_BYTES);
+    let result = (|| {
+        if parts.is_empty() {
+            write_stderr(first_prompt);
+            let line = read_line()?;
+            write_stderr("\n");
+            parts.push(line);
+        }
+        if parts.len() == 1 && wants_second(&parts[0])? {
+            write_stderr(second_prompt);
+            let line = read_line()?;
+            write_stderr("\n");
+            parts.push(line);
+        }
+        Ok(())
+    })();
+    drop(restore);
+    result
+}
+
+/// One line from descriptor 0, without the newline.
+fn read_line() -> Result<Secret> {
+    let mut line = Secret::new();
     let mut byte = [0u8; 1];
-    let result = loop {
+    loop {
         // SAFETY: reads one byte into a stack buffer.
         let n = unsafe { libc::read(0, byte.as_mut_ptr().cast(), 1) };
         if n < 0 {
             if errno() == libc::EINTR {
                 if CAUGHT.load(Ordering::SeqCst) != 0 {
-                    break Err(Exit::usage("interrupted"));
+                    wipe(&mut byte);
+                    return Err(Exit::usage("interrupted"));
                 }
                 continue;
             }
-            break Err(Exit::api("cannot read the terminal"));
+            return Err(Exit::api("cannot read the terminal"));
         }
         if n == 0 || byte[0] == b'\n' {
-            break Ok(());
+            wipe(&mut byte);
+            return Ok(line);
         }
-        if line.len() >= MAX_KEY_BYTES {
-            break Err(Exit::usage(format!(
-                "the input is longer than {MAX_KEY_BYTES} bytes; that is not an IONOS API key"
-            )));
-        }
-        line.push(byte[0]);
-    };
-    wipe(&mut byte);
-    drop(restore);
-    write_stderr("\n");
-    match result {
-        Ok(()) => Ok(line),
-        Err(e) => {
-            wipe(&mut line);
-            Err(e)
+        if !line.extend(&byte) {
+            wipe(&mut byte);
+            return Err(too_long());
         }
     }
 }

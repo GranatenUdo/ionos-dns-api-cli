@@ -342,35 +342,54 @@ fn login(
     }
     let path = key::key_path(key_file)?;
     key::check_target(&path, force)?;
-    let mut raw = if from_stdin {
+    let (entered, two_parts) = if from_stdin {
         if prompt::stdin_is_terminal() {
             return Err(Exit::usage(
                 "standard input is a terminal, where --stdin would show the key: omit --stdin for hidden entry",
             ));
         }
-        prompt::read_stdin()?
+        key_from_stdin()?
     } else {
         // Checked before a browser opens, so `login </dev/null` or `login &` never launches one.
         prompt::check_terminal()?;
         let mut opener = open_portal(no_browser);
         eprintln!("The key will be stored in {}.", path.display());
-        let entered = prompt::read_hidden("IONOS API key (input hidden): ");
+        // A first part with a dot is the whole key; without one it is the prefix and the encrypted part follows.
+        let wants_second = |first: &key::Secret| -> Result<bool> {
+            let cleaned = key::clean_part(first.as_slice(), "first input")?;
+            if cleaned.as_slice().is_empty() {
+                return Err(Exit::usage("nothing was entered"));
+            }
+            Ok(!cleaned.as_slice().contains(&b'.'))
+        };
+        let parts = prompt::read_hidden_parts(
+            "Key prefix, or the whole key (input hidden): ",
+            "Encrypted part of the key (input hidden): ",
+            &wants_second,
+        );
         if let Some(child) = opener.as_mut() {
             let _ = child.try_wait();
         }
-        entered?
+        let parts = parts?;
+        assemble_parts(&parts)?
     };
-    let parsed = std::str::from_utf8(&raw).ok().and_then(key::ApiKey::parse);
-    key::wipe(&mut raw);
-    let entered = parsed
-        .ok_or_else(|| Exit::usage("that is not an IONOS API key of the form <prefix>.<secret>"))?;
     let dir = key::prepare_dir(&path)?;
     let temp = key::TempKey::write(&dir, &entered)?;
     drop(entered);
     // The test call uses the key as every other command does: loaded from a private file.
     let stored = key::load(temp.path())?;
     let prefix = stored.prefix().to_owned();
-    let zones = model::zones_from(&client::Client::new(stored)?.zones()?)?;
+    let zones = client::Client::new(stored)?
+        .zones()
+        .map_err(|mut e| {
+            if two_parts && e.message.contains("HTTP 401") {
+                e.message.push_str(
+                    "; check that the key prefix came first and the encrypted part second",
+                );
+            }
+            e
+        })
+        .and_then(|v| model::zones_from(&v))?;
     temp.commit(&path, force)?;
     println!(
         "Stored the key {prefix}.… in {}. The API accepted it and lists {} zone{}.",
@@ -379,6 +398,49 @@ fn login(
         if zones.len() == 1 { "" } else { "s" }
     );
     Ok(0)
+}
+
+/// The key from one or two cleaned parts; the flag says whether it was entered in two parts.
+fn assemble_parts(raw: &[key::Secret]) -> Result<(key::ApiKey, bool)> {
+    match raw {
+        [whole] => Ok((
+            key::assemble(&key::clean_part(whole.as_slice(), "key")?, None)?,
+            false,
+        )),
+        [prefix, secret] => {
+            let prefix = key::clean_part(prefix.as_slice(), "key prefix")?;
+            let secret = key::clean_part(secret.as_slice(), "encrypted part")?;
+            Ok((key::assemble(&prefix, Some(&secret))?, true))
+        }
+        _ => Err(Exit::usage(
+            "expected the whole key, or the key prefix and the encrypted part",
+        )),
+    }
+}
+
+/// `--stdin`: the whole key on one line, or the prefix and the encrypted part on two lines (blank lines and
+/// surrounding whitespace, CRLF included, are ignored).
+fn key_from_stdin() -> Result<(key::ApiKey, bool)> {
+    let input = prompt::read_stdin()?;
+    let mut lines = Vec::new();
+    for line in input.as_slice().split(|b| *b == b'\n') {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        if lines.len() == 2 {
+            return Err(Exit::usage(
+                "standard input has more than two lines: expected the whole key, or the key prefix and the \
+                 encrypted part on two lines",
+            ));
+        }
+        let mut part = key::Secret::new();
+        part.extend(line);
+        lines.push(part);
+    }
+    if lines.is_empty() {
+        return Err(Exit::usage("standard input is empty"));
+    }
+    assemble_parts(&lines)
 }
 
 /// Opens the key page in the default browser (`xdg-open`, `open` on macOS) in a session of its own, so the prompt's
