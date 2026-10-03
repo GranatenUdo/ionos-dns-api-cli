@@ -43,6 +43,9 @@ enum Command {
         /// Replace a key that is already stored
         #[arg(long)]
         force: bool,
+        /// Do not open the IONOS key page in a browser; just print its address
+        #[arg(long)]
+        no_browser: bool,
         /// Catches a key typed as an argument, which is rejected without repeating it.
         #[arg(hide = true, num_args = 0.., allow_hyphen_values = true)]
         stray: Vec<String>,
@@ -119,8 +122,9 @@ enum Format {
     Json,
 }
 
-/// Where API keys are created.
-const PORTAL_URL: &str = "https://developer.hosting.ionos.de/docs/getstarted";
+/// The IONOS developer portal's API-key page, where keys are created and deleted.
+const PORTAL_URL: &str = "https://developer.hosting.ionos.de/keys";
+const PORTAL_STEPS: &str = "click \"Create New Key\", copy the key, then paste it here";
 
 fn main() -> ExitCode {
     // No core dumps: a dump during a request would contain the key.
@@ -146,8 +150,9 @@ fn run(cli: Cli) -> Result<u8> {
         Command::Login {
             stdin,
             force,
+            no_browser,
             stray,
-        } => login(key_file, stdin, force, &stray),
+        } => login(key_file, stdin, force, no_browser, &stray),
         Command::Logout => {
             let path = key::key_path(key_file)?;
             if key::remove(&path)? {
@@ -321,7 +326,13 @@ fn run(cli: Cli) -> Result<u8> {
     }
 }
 
-fn login(key_file: Option<&Path>, from_stdin: bool, force: bool, stray: &[String]) -> Result<u8> {
+fn login(
+    key_file: Option<&Path>,
+    from_stdin: bool,
+    force: bool,
+    no_browser: bool,
+    stray: &[String],
+) -> Result<u8> {
     if !stray.is_empty() {
         return Err(Exit::usage(
             "login takes no key as an argument: an argument is visible to other processes and stays in your shell \
@@ -339,11 +350,15 @@ fn login(key_file: Option<&Path>, from_stdin: bool, force: bool, stray: &[String
         }
         prompt::read_stdin()?
     } else {
-        eprintln!(
-            "Create an API key in the IONOS developer portal: {PORTAL_URL}\nIt will be stored in {}.",
-            path.display()
-        );
-        prompt::read_hidden("IONOS API key (input hidden): ")?
+        // Checked before a browser opens, so `login </dev/null` or `login &` never launches one.
+        prompt::check_terminal()?;
+        let mut opener = open_portal(no_browser);
+        eprintln!("The key will be stored in {}.", path.display());
+        let entered = prompt::read_hidden("IONOS API key (input hidden): ");
+        if let Some(child) = opener.as_mut() {
+            let _ = child.try_wait();
+        }
+        entered?
     };
     let parsed = std::str::from_utf8(&raw).ok().and_then(key::ApiKey::parse);
     key::wipe(&mut raw);
@@ -364,6 +379,60 @@ fn login(key_file: Option<&Path>, from_stdin: bool, force: bool, stray: &[String
         if zones.len() == 1 { "" } else { "s" }
     );
     Ok(0)
+}
+
+/// Opens the key page in the default browser (`xdg-open`, `open` on macOS) in a session of its own, so the prompt's
+/// Ctrl-C or Ctrl-Z never reaches it and it cannot open this terminal. Never a failure: without a graphical session,
+/// over SSH, with `--no-browser` or when the opener cannot start, the address is printed instead.
+fn open_portal(no_browser: bool) -> Option<std::process::Child> {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    let set = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty());
+    let skip = if no_browser {
+        Some("--no-browser")
+    } else if set("SSH_CONNECTION") || set("SSH_TTY") {
+        Some("SSH session")
+    } else if cfg!(not(target_os = "macos")) && !set("WAYLAND_DISPLAY") && !set("DISPLAY") {
+        Some("no graphical session")
+    } else {
+        None
+    };
+    if let Some(reason) = skip {
+        eprintln!("Open {PORTAL_URL} in a browser ({reason}): {PORTAL_STEPS}.");
+        return None;
+    }
+    let program = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let mut command = Command::new(program);
+    command
+        .arg(PORTAL_URL)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: setsid is async-signal-safe and cannot fail in a freshly forked child (never a group leader).
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    match command.spawn() {
+        Ok(child) => {
+            eprintln!(
+                "Opening {PORTAL_URL} in your browser: {PORTAL_STEPS}. If nothing opens, visit the address yourself."
+            );
+            Some(child)
+        }
+        Err(_) => {
+            eprintln!("Could not start a browser ({program}); open {PORTAL_URL}: {PORTAL_STEPS}.");
+            None
+        }
+    }
 }
 
 fn status(key_file: Option<&Path>, json: bool) -> Result<u8> {

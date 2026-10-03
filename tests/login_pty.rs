@@ -60,10 +60,25 @@ struct Session {
 
 /// Runs `login` with the pty as its controlling terminal, waits for the prompt, then types or interrupts.
 fn session(home: &std::path::Path, base: &str, action: Action) -> Session {
+    session_with(home, base, &[], &[], action)
+}
+
+fn session_with(
+    home: &std::path::Path,
+    base: &str,
+    extra_args: &[&str],
+    envs: &[(&str, &str)],
+    action: Action,
+) -> Session {
     let pty = open_pty();
     assert!(echo_on(&pty.slave), "a new pty starts with echo on");
     let child_stdin = pty.slave.try_clone().unwrap();
-    let mut cmd = command(&["login"], Some(base), home);
+    let mut args = vec!["login"];
+    args.extend_from_slice(extra_args);
+    let mut cmd = command(&args, Some(base), home);
+    for (name, value) in envs {
+        cmd.env(name, value);
+    }
     cmd.stdin(Stdio::from(child_stdin))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -155,7 +170,11 @@ fn the_key_is_entered_hidden_and_echo_comes_back() {
     );
     assert!(!format!("{}{}", s.stdout, s.stderr).contains("TopSecretValue123"));
     assert!(s.echo_restored, "echo stays off after login");
-    assert!(s.stderr.contains("developer portal"), "{}", s.stderr);
+    assert!(
+        s.stderr.contains("developer.hosting.ionos.de/keys"),
+        "{}",
+        s.stderr
+    );
     assert_eq!(
         std::fs::read_to_string(home.join(".config/ionos-dns/api-key")).unwrap(),
         format!("{KEY}\n")
@@ -189,4 +208,99 @@ fn an_interrupt_restores_echo_and_stores_nothing() {
     );
     assert!(!home.join(".config/ionos-dns/api-key").exists());
     assert!(stub.requests.lock().unwrap().is_empty());
+}
+
+const KEY_PAGE: &str = "https://developer.hosting.ionos.de/keys";
+
+#[test]
+fn login_opens_the_key_page_in_a_session_of_its_own() {
+    let stub = api_stub();
+    let home = temp_dir();
+    let s = session_with(
+        &home,
+        &stub.base,
+        &[],
+        &[("DISPLAY", ":99")],
+        Action::Type(format!("{KEY}\n").as_bytes()),
+    );
+    assert_eq!(s.status.code(), Some(0), "{}{}", s.stdout, s.stderr);
+    let record = wait_for_record(&home, 10).expect("the opener was not called");
+    assert!(record.contains(&format!("args:{KEY_PAGE}\n")), "{record}");
+    for fd in ["fd0", "fd1", "fd2"] {
+        assert!(record.contains(&format!("{fd}:/dev/null\n")), "{record}");
+    }
+    assert!(
+        record.contains("no-ctty"),
+        "the opener can reach the terminal:\n{record}"
+    );
+    let opening = s.stderr.find("Opening").expect("no Opening line");
+    let prompt = s.stderr.find("(input hidden): ").expect("no prompt");
+    assert!(
+        opening < prompt,
+        "the browser is opened before the prompt:\n{}",
+        s.stderr
+    );
+}
+
+/// Extra arguments, extra environment, and the reason login prints.
+type Case<'a> = (&'a [&'a str], &'a [(&'a str, &'a str)], &'a str);
+
+#[test]
+fn no_browser_over_ssh_without_display_or_when_asked() {
+    let stub = api_stub();
+    let cases: [Case; 3] = [
+        (&["--no-browser"], &[("DISPLAY", ":99")], "(--no-browser)"),
+        (
+            &[],
+            &[
+                ("DISPLAY", ":99"),
+                ("SSH_CONNECTION", "192.0.2.1 22 192.0.2.2 22"),
+            ],
+            "(SSH session)",
+        ),
+        (&[], &[], "(no graphical session)"),
+    ];
+    for (args, envs, reason) in cases {
+        let home = temp_dir();
+        let s = session_with(
+            &home,
+            &stub.base,
+            args,
+            envs,
+            Action::Type(format!("{KEY}\n").as_bytes()),
+        );
+        assert_eq!(s.status.code(), Some(0), "{}{}", s.stdout, s.stderr);
+        assert!(
+            s.stderr
+                .contains(&format!("Open {KEY_PAGE} in a browser {reason}")),
+            "{}",
+            s.stderr
+        );
+        assert!(
+            wait_for_record(&home, 1).is_none(),
+            "the opener was called for {reason}"
+        );
+    }
+}
+
+#[test]
+fn a_missing_opener_does_not_stop_login() {
+    let stub = api_stub();
+    let home = temp_dir();
+    let empty = home.join("empty-bin");
+    std::fs::create_dir_all(&empty).unwrap();
+    let s = session_with(
+        &home,
+        &stub.base,
+        &[],
+        &[("DISPLAY", ":99"), ("PATH", empty.to_str().unwrap())],
+        Action::Type(format!("{KEY}\n").as_bytes()),
+    );
+    assert_eq!(s.status.code(), Some(0), "{}{}", s.stdout, s.stderr);
+    assert!(
+        s.stderr.contains("Could not start a browser"),
+        "{}",
+        s.stderr
+    );
+    assert!(home.join(".config/ionos-dns/api-key").is_file());
 }

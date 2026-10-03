@@ -345,3 +345,19 @@ fn status_reports_and_checks_only_compliant_files() {
         "a non-compliant key file is never sent to the API"
     );
 }
+
+#[test]
+fn stdin_login_and_login_without_a_terminal_never_open_a_browser() {
+    let stub = api_stub();
+    let home = temp_dir();
+    let mut piped = command(&["login", "--stdin"], Some(&stub.base), &home);
+    piped.env("DISPLAY", ":99");
+    let out = run_input(&mut piped, KEY.as_bytes());
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let mut no_tty = command(&["login", "--force"], Some(&stub.base), &home);
+    no_tty.env("DISPLAY", ":99");
+    let out = no_tty.output().unwrap();
+    assert_no_leak(&out);
+    assert_eq!(code(&out), 2, "{}", stderr(&out));
+    assert!(wait_for_record(&home, 1).is_none(), "a browser was opened");
+}

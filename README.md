@@ -23,16 +23,20 @@ Create a key in the IONOS developer portal (<https://developer.hosting.ionos.de/
 delete it in the portal when you no longer need it.
 
 ```sh
-ionos-dns login      # hidden prompt; tests the key with one read-only call, then stores it
+ionos-dns login      # opens the key page, hidden prompt, tests the key with one read-only call, stores it
 ionos-dns status     # which file, its permissions, the key's public prefix, and whether the API accepts it
 ionos-dns logout     # removes the key file (the key stays valid until you delete it in the portal)
 ```
 
-`login` reads the key at a hidden prompt (echo off; Ctrl-C and Ctrl-Z restore the terminal), checks its form, asks the
-API for the zone list with it, and only then stores it in a file of mode 0600 in a directory of mode 0700. It never
-replaces a stored key unless you pass `--force`, and it refuses a key given as a command-line argument, because
-arguments are visible to other processes and land in your shell history. For scripts, pipe the key in with
-`login --stdin` (refused when standard input is a terminal, which would show the key).
+`login` opens the IONOS key page (<https://developer.hosting.ionos.de/keys>) in your default browser: sign in, click
+"Create New Key", copy the key and paste it at the hidden prompt (echo off; Ctrl-C and Ctrl-Z restore the terminal).
+The browser runs in a session of its own, so it never sees the prompt. Over SSH, without a graphical session, or with
+`--no-browser`, the address is printed instead. `login` then checks the key's form, asks the API for the zone list
+with it, and only then stores it in a file of mode 0600 in a directory of mode 0700. It never replaces a stored key
+unless you pass `--force`, and it refuses a key given as a command-line argument, because arguments are visible to
+other processes and land in your shell history. For scripts, pipe the key in with `login --stdin` (refused when
+standard input is a terminal, which would show the key). The IONOS API has no browser sign-in that could hand a key
+back to the command line: keys are created only on that page.
 
 At use time, every command reads the key **only from that file**: it must belong to you and must not be readable by
 group or others. The key is never accepted as an argument or environment variable and never printed. The file is

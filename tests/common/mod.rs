@@ -42,19 +42,74 @@ pub const KEY: &str = "testprefix.TopSecretValue123";
 
 // ---------- running the binary ----------
 
-/// The binary with a clean environment: only HOME (and the optional API base) set from the test.
+/// The binary with a clean environment: only HOME (and the optional API base) set from the test. No graphical or
+/// SSH session variables, and a fake `xdg-open`/`open` first on PATH, so no test can ever open a real browser; a
+/// test that wants the opener sets DISPLAY itself and reads `opener_record(home)`.
 pub fn command(args: &[&str], base: Option<&str>, home: &Path) -> Command {
+    let fake_bin = fake_opener(home);
+    let path = format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
     let mut command = Command::new(env!("CARGO_BIN_EXE_ionos-dns"));
     command
         .args(args)
         .env_remove("IONOS_API_KEY_FILE")
         .env_remove("IONOS_DNS_API_BASE")
         .env_remove("XDG_CONFIG_HOME")
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("SSH_CONNECTION")
+        .env_remove("SSH_TTY")
+        .env("PATH", path)
         .env("HOME", home);
     if let Some(base) = base {
         command.env("IONOS_DNS_API_BASE", base);
     }
     command
+}
+
+/// Where the fake opener records its call: its arguments, its descriptors 0-2 and whether /dev/tty opens.
+pub fn opener_record(home: &Path) -> PathBuf {
+    home.join("opener-record")
+}
+
+/// Installs the fake `xdg-open` and `open` under `home/.fakebin` (idempotent) and returns that directory.
+pub fn fake_opener(home: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = home.join(".fakebin");
+    if bin.join("xdg-open").exists() {
+        return bin;
+    }
+    std::fs::create_dir_all(&bin).unwrap();
+    let record = opener_record(home);
+    let script = format!(
+        "#!/bin/sh\n\
+         f0=$(readlink /proc/$$/fd/0); f1=$(readlink /proc/$$/fd/1); f2=$(readlink /proc/$$/fd/2)\n\
+         if (exec 3</dev/tty) 2>/dev/null; then tty=ctty; else tty=no-ctty; fi\n\
+         printf 'args:%s\\nfd0:%s\\nfd1:%s\\nfd2:%s\\n%s\\n' \"$*\" \"$f0\" \"$f1\" \"$f2\" \"$tty\" > '{rec}.tmp'\n\
+         mv '{rec}.tmp' '{rec}'\n",
+        rec = record.display()
+    );
+    for name in ["xdg-open", "open"] {
+        let file = bin.join(name);
+        std::fs::write(&file, &script).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    bin
+}
+
+/// Waits up to `seconds` for the fake opener's record.
+pub fn wait_for_record(home: &Path, seconds: u64) -> Option<String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    while std::time::Instant::now() < deadline {
+        if let Ok(text) = std::fs::read_to_string(opener_record(home)) {
+            return Some(text);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    None
 }
 
 pub fn run(args: &[&str], base: Option<&str>, home: &Path) -> Output {

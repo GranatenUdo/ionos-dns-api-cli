@@ -75,21 +75,28 @@ pub fn read_stdin() -> Result<Vec<u8>> {
 }
 
 /// One line from the terminal with echo off.
-pub fn read_hidden(prompt: &str) -> Result<Vec<u8>> {
+/// Standard input is this process's controlling terminal and we are in its foreground process group: the only
+/// situation in which the hidden prompt can work. `login` checks this before it opens a browser.
+pub fn check_terminal() -> Result<()> {
     if !stdin_is_terminal() {
         return Err(Exit::usage(
             "standard input is not a terminal; pipe the key with --stdin",
         ));
     }
+    // SAFETY: plain queries on descriptor 0 and the calling process.
+    let (foreground, group) = unsafe { (libc::tcgetpgrp(0), libc::getpgrp()) };
+    if foreground == -1 || foreground != group {
+        return Err(Exit::usage(
+            "the terminal is not controlled by this process (background job or no controlling terminal); \
+             run login in the foreground or use --stdin",
+        ));
+    }
+    Ok(())
+}
+
+pub fn read_hidden(prompt: &str) -> Result<Vec<u8>> {
     loop {
-        // SAFETY: plain queries on descriptor 0 and the calling process.
-        let (foreground, group) = unsafe { (libc::tcgetpgrp(0), libc::getpgrp()) };
-        if foreground == -1 || foreground != group {
-            return Err(Exit::usage(
-                "the terminal is not controlled by this process (background job or no controlling terminal); \
-                 run login in the foreground or use --stdin",
-            ));
-        }
+        check_terminal()?;
         CAUGHT.store(0, Ordering::SeqCst);
         let saved = install_handlers();
         let outcome = hidden_line(prompt);
